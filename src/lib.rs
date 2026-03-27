@@ -242,11 +242,11 @@ impl TelegramBot {
                 }
             }
 
-            pending_approvals.retain(|request_id, approval| {
+            pending_approvals.retain(|_token, approval| {
                 if approval.created_at.elapsed() > APPROVAL_TTL {
                     let _ = log::warn(format!(
-                        "Approval {request_id} for chat {} expired — cleaning up",
-                        approval.chat_id,
+                        "Approval {} for chat {} expired — cleaning up",
+                        approval.full_request_id, approval.chat_id,
                     ));
                     false
                 } else {
@@ -569,7 +569,7 @@ fn handle_callback(
                 let topic = format!("astrid.v1.elicit.response.{full_id}");
                 if let Err(e) = ipc::publish_json(&topic, &payload) {
                     let _ = log::error(format!(
-                        "Failed to publish elicitation response for {request_id}: {e:?}"
+                        "Failed to publish elicitation response for {full_id}: {e:?}"
                     ));
                     // Re-insert so user can retry.
                     if let (Some(cid), Some(eli)) = (chat_id, removed) {
@@ -722,6 +722,10 @@ fn handle_ipc_event(
                 return;
             };
 
+            // Bump activity so the turn isn't reaped while waiting for user input.
+            if let Some(turn) = turns.get_mut(&chat_id) {
+                turn.last_activity = Instant::now();
+            }
             handle_elicitation_request(
                 token,
                 chat_id,
@@ -1025,7 +1029,8 @@ fn callback_token(request_id: &str) -> String {
     if request_id.len() <= MAX_TOKEN_LEN {
         request_id.to_string()
     } else {
-        // Simple FNV-like hash to produce a short, collision-resistant token.
+        // FNV-1a 64-bit hash. Not cryptographically collision-resistant, but
+        // sufficient for mapping transient callback tokens (short-lived, low volume).
         let mut hash: u64 = 0xcbf29ce484222325;
         for byte in request_id.as_bytes() {
             hash ^= *byte as u64;
