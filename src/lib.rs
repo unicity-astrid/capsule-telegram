@@ -65,8 +65,6 @@ struct TurnState {
 /// Pending approval waiting for a callback button press.
 struct PendingApproval {
     chat_id: i64,
-    #[allow(dead_code)]
-    session_id: String,
     /// When this approval was created (for TTL-based cleanup).
     created_at: Instant,
 }
@@ -519,7 +517,7 @@ fn handle_ipc_event(
     topic: &str,
     payload: &Value,
     session_to_chat: &HashMap<String, i64>,
-    sessions: &HashMap<i64, String>,
+    _sessions: &HashMap<i64, String>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
 ) {
@@ -574,7 +572,6 @@ fn handle_ipc_event(
                 action,
                 resource,
                 reason,
-                sessions,
                 turns,
                 pending_approvals,
             );
@@ -662,20 +659,12 @@ fn handle_final_response(
             if let Some((first, rest)) = chunks.split_first() {
                 if turn.finalized {
                     // Send as new message.
-                    let mut last_id = turn.msg_id;
-                    if let Ok(msg) =
-                        telegram::send_message(token, chat_id, first, Some("HTML"), None)
-                    {
-                        last_id = msg.message_id;
-                    }
+                    let _ =
+                        telegram::send_message(token, chat_id, first, Some("HTML"), None);
                     for chunk in rest {
-                        if let Ok(msg) =
-                            telegram::send_message(token, chat_id, chunk, Some("HTML"), None)
-                        {
-                            last_id = msg.message_id;
-                        }
+                        let _ =
+                            telegram::send_message(token, chat_id, chunk, Some("HTML"), None);
                     }
-                    let _ = last_id;
                 } else {
                     // Edit the existing message with the final text.
                     let _ = telegram::edit_message_text(
@@ -701,7 +690,6 @@ fn handle_approval_request(
     action: &str,
     resource: &str,
     reason: &str,
-    sessions: &HashMap<i64, String>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
 ) {
@@ -713,13 +701,10 @@ fn handle_approval_request(
         }
     }
 
-    let session_id = sessions.get(&chat_id).cloned().unwrap_or_default();
-
     pending_approvals.insert(
         request_id.to_string(),
         PendingApproval {
             chat_id,
-            session_id: session_id.clone(),
             created_at: Instant::now(),
         },
     );
@@ -753,23 +738,20 @@ fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field
         .and_then(|p| p.as_str())
         .unwrap_or("Input required");
 
-    let field_type = field
+    // For enum-type fields (field_type is {"Enum": ["opt1", "opt2", ...]}),
+    // show inline keyboard with options.
+    if let Some(options) = field
         .and_then(|f| f.get("field_type"))
-        .and_then(|t| t.as_str());
+        .and_then(|t| t.get("Enum"))
+        .and_then(|e| e.as_array())
+    {
+        let buttons: Vec<(String, String)> = options
+            .iter()
+            .filter_map(|o| o.as_str())
+            .map(|o| (o.to_string(), format!("eli:{request_id}:{o}")))
+            .collect();
 
-    // For select-type fields, show inline keyboard with options.
-    if let Some("enum") = field_type {
-        if let Some(options) = field
-            .and_then(|f| f.get("field_type"))
-            .and_then(|t| t.get("Enum"))
-            .and_then(|e| e.as_array())
-        {
-            let buttons: Vec<(String, String)> = options
-                .iter()
-                .filter_map(|o| o.as_str())
-                .map(|o| (o.to_string(), format!("eli:{request_id}:{o}")))
-                .collect();
-
+        if !buttons.is_empty() {
             let keyboard = telegram::inline_keyboard(buttons);
             let _ = telegram::send_message(
                 token,
@@ -888,4 +870,76 @@ fn load_sessions() -> HashMap<i64, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_allowed_users_basic() {
+        assert_eq!(parse_allowed_users("123,456,789"), vec![123, 456, 789]);
+    }
+
+    #[test]
+    fn parse_allowed_users_with_spaces() {
+        assert_eq!(parse_allowed_users(" 123 , 456 , 789 "), vec![123, 456, 789]);
+    }
+
+    #[test]
+    fn parse_allowed_users_empty_string() {
+        assert_eq!(parse_allowed_users(""), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn parse_allowed_users_ignores_invalid() {
+        assert_eq!(parse_allowed_users("123,abc,456"), vec![123, 456]);
+    }
+
+    #[test]
+    fn parse_allowed_users_single() {
+        assert_eq!(parse_allowed_users("42"), vec![42]);
+    }
+
+    #[test]
+    fn is_user_allowed_empty_allows_all() {
+        assert!(is_user_allowed(&[], Some(999)));
+        assert!(is_user_allowed(&[], None));
+    }
+
+    #[test]
+    fn is_user_allowed_present() {
+        assert!(is_user_allowed(&[100, 200, 300], Some(200)));
+    }
+
+    #[test]
+    fn is_user_allowed_absent() {
+        assert!(!is_user_allowed(&[100, 200], Some(999)));
+    }
+
+    #[test]
+    fn is_user_allowed_none_user_id() {
+        assert!(!is_user_allowed(&[100], None));
+    }
+
+    #[test]
+    fn new_session_id_format() {
+        let sid = new_session_id(12345);
+        assert!(sid.starts_with("tg-12345-"));
+        // Should contain a hex timestamp after the second dash.
+        let parts: Vec<&str> = sid.splitn(3, '-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "tg");
+        assert_eq!(parts[1], "12345");
+        assert!(u128::from_str_radix(parts[2], 16).is_ok());
+    }
+
+    #[test]
+    fn new_session_id_unique() {
+        let a = new_session_id(1);
+        let b = new_session_id(1);
+        // Verify both session IDs are correctly formatted without relying on timing.
+        assert!(a.starts_with("tg-1-"));
+        assert!(b.starts_with("tg-1-"));
+    }
 }

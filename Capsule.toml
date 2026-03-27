@@ -16,27 +16,15 @@ uplink = true
 net = ["*"]
 ipc_publish = [
     "user.v1.prompt",
-    "client.v1.disconnect",
-    "astrid.v1.request.*",
-    "astrid.v1.elicit.response.*",
     "astrid.v1.approval.response.*",
-    "registry.v1.get_providers",
-    "registry.v1.set_active_model",
-    "registry.v1.selection.*",
-    "session.v1.request.*",
+    "astrid.v1.elicit.response.*",
 ]
 ipc_subscribe = [
     "agent.v1.response",
     "agent.v1.stream.delta",
     "astrid.v1.approval",
-    "astrid.v1.capsules_loaded",
     "astrid.v1.elicit.*",
-    "astrid.v1.onboarding.required",
     "astrid.v1.response.*",
-    "registry.v1.response.*",
-    "registry.v1.active_model_changed",
-    "registry.v1.selection.*",
-    "session.v1.response.*",
 ]
 
 [env]
