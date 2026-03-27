@@ -24,16 +24,28 @@ Telegram Bot uplink capsule for [Astrid OS](https://github.com/unicity-astrid/as
 ### 2. Install the Capsule
 
 ```bash
-astrid capsule install capsule-telegram
+astrid capsule install @unicity-astrid/capsule-telegram
+```
+
+Or from a local checkout:
+
+```bash
+astrid capsule install ~/path/to/capsule-telegram
 ```
 
 During installation, you'll be prompted for:
 - **Bot Token** — the token from BotFather
 - **Allowed User IDs** — comma-separated Telegram user IDs (leave empty to allow all users)
 
+Configuration is preserved across reinstalls (use `astrid capsule remove --purge` to clear it).
+
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
-### 3. Use It
+### 3. Start the Daemon and Use It
+
+```bash
+astrid start
+```
 
 Open your bot in Telegram and send a message. The agent will respond in the chat.
 
