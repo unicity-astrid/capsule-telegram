@@ -26,6 +26,12 @@ const EDIT_THROTTLE: Duration = Duration::from_millis(500);
 /// event processing between polls.
 const POLL_TIMEOUT: u32 = 1;
 
+/// Maximum age before an in-progress turn is considered stale and cleaned up.
+const TURN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum age before a pending approval is considered stale and cleaned up.
+const APPROVAL_TTL: Duration = Duration::from_secs(300);
+
 /// KV key for the last processed Telegram update offset.
 const KV_OFFSET: &str = "tg.offset";
 
@@ -45,6 +51,8 @@ struct TurnState {
     last_edit: Instant,
     /// Whether the current message has been finalized (e.g. before a tool).
     finalized: bool,
+    /// When this turn was created (for timeout-based cleanup).
+    created_at: Instant,
 }
 
 /// Pending approval waiting for a callback button press.
@@ -52,6 +60,8 @@ struct PendingApproval {
     chat_id: i64,
     #[allow(dead_code)]
     session_id: String,
+    /// When this approval was created (for TTL-based cleanup).
+    created_at: Instant,
 }
 
 /// Telegram Bot uplink capsule.
@@ -150,6 +160,39 @@ impl TelegramBot {
                     _ => {}
                 }
             }
+
+            // Phase C: clean up stale turns and expired approvals.
+            turns.retain(|chat_id, turn| {
+                if turn.created_at.elapsed() > TURN_TIMEOUT {
+                    let _ = log::warn(format!(
+                        "Turn for chat {chat_id} timed out after {}s — cleaning up",
+                        TURN_TIMEOUT.as_secs()
+                    ));
+                    let _ = telegram::edit_message_text(
+                        &bot_token,
+                        *chat_id,
+                        turn.msg_id,
+                        "Turn timed out.",
+                        None,
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+
+            pending_approvals.retain(|request_id, approval| {
+                if approval.created_at.elapsed() > APPROVAL_TTL {
+                    let _ = log::warn(format!(
+                        "Approval {request_id} for chat {} expired after {}s — cleaning up",
+                        approval.chat_id,
+                        APPROVAL_TTL.as_secs()
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 }
@@ -240,6 +283,7 @@ fn handle_message(
                 .checked_sub(EDIT_THROTTLE)
                 .unwrap_or_else(Instant::now),
             finalized: false,
+            created_at: Instant::now(),
         },
     );
 
@@ -632,6 +676,7 @@ fn handle_approval_request(
         PendingApproval {
             chat_id,
             session_id: session_id.clone(),
+            created_at: Instant::now(),
         },
     );
 
