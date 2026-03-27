@@ -15,9 +15,58 @@ const BASE_URL: &str = "https://api.telegram.org";
 /// HTTP response.
 #[derive(Deserialize)]
 struct HttpEnvelope {
-    #[allow(dead_code)]
     status: u16,
     body: String,
+}
+
+/// Unwrap the SDK HTTP envelope from the response and check HTTP status.
+///
+/// Returns the response body string on success, or an appropriate `SysError`
+/// for rate-limiting, server errors, and client errors.
+fn unwrap_envelope(resp: http::Response, method: &str) -> Result<String, SysError> {
+    let envelope: HttpEnvelope = resp
+        .json()
+        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse HTTP envelope: {e}")))?;
+
+    // Check HTTP status before attempting to parse the Telegram response.
+    if envelope.status == 429 {
+        return Err(SysError::ApiError(format!(
+            "{method}: Rate limited by Telegram API"
+        )));
+    }
+    if envelope.status >= 500 {
+        let truncated: String = envelope.body.chars().take(200).collect();
+        let suffix = if envelope.body.chars().count() > 200 {
+            "..."
+        } else {
+            ""
+        };
+        return Err(SysError::ApiError(format!(
+            "{method}: server error {}: {truncated}{suffix}",
+            envelope.status
+        )));
+    }
+    if envelope.status >= 400 {
+        // Try to extract the Telegram error description from the response body.
+        if let Ok(err_resp) =
+            serde_json::from_str::<TgResponse<serde_json::Value>>(&envelope.body)
+        {
+            if !err_resp.ok {
+                return Err(SysError::ApiError(format!(
+                    "{method}: {}",
+                    err_resp
+                        .description
+                        .unwrap_or_else(|| format!("HTTP {}", envelope.status)),
+                )));
+            }
+        }
+        return Err(SysError::ApiError(format!(
+            "{method}: HTTP {}",
+            envelope.status
+        )));
+    }
+
+    Ok(envelope.body)
 }
 
 /// Parse a Telegram API response from the SDK's HTTP envelope.
@@ -25,13 +74,10 @@ fn parse_response<T: serde::de::DeserializeOwned>(
     resp: http::Response,
     method: &str,
 ) -> Result<T, SysError> {
-    // First: unwrap the SDK envelope to get the actual HTTP body.
-    let envelope: HttpEnvelope = resp
-        .json()
-        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse HTTP envelope: {e}")))?;
+    let body = unwrap_envelope(resp, method)?;
 
-    // Second: parse the Telegram JSON from the body string.
-    let parsed: TgResponse<T> = serde_json::from_str(&envelope.body)
+    // Parse the Telegram JSON from the body string.
+    let parsed: TgResponse<T> = serde_json::from_str(&body)
         .map_err(|e| SysError::ApiError(format!("{method}: failed to parse Telegram response: {e}")))?;
 
     if !parsed.ok {
@@ -106,17 +152,21 @@ pub fn edit_message_text(
     let req = http::Request::post(&url).json(&body)?;
     let resp = http::send(&req)?;
 
-    let envelope: HttpEnvelope = resp
-        .json()
-        .map_err(|e| SysError::ApiError(format!("editMessageText: envelope parse error: {e}")))?;
+    // Telegram returns "message is not modified" (HTTP 400) when text is
+    // unchanged — not a real error for our throttled-edit pattern. Catch that
+    // specific error from `unwrap_envelope` and treat it as success.
+    let body_str = match unwrap_envelope(resp, "editMessageText") {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("message is not modified") {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
 
-    // Telegram returns "message is not modified" when text is unchanged —
-    // not a real error for our throttled-edit pattern.
-    if envelope.body.contains("message is not modified") {
-        return Ok(());
-    }
-
-    let parsed: TgResponse<serde_json::Value> = serde_json::from_str(&envelope.body)
+    let parsed: TgResponse<serde_json::Value> = serde_json::from_str(&body_str)
         .map_err(|e| SysError::ApiError(format!("editMessageText: parse error: {e}")))?;
 
     if !parsed.ok {

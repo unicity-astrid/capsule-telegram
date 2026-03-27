@@ -484,6 +484,14 @@ fn handle_ipc_poll(
         Err(_) => return,
     };
 
+    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64()) {
+        if dropped > 0 {
+            let _ = log::warn(format!(
+                "IPC bus dropped {dropped} messages — responses may be stale"
+            ));
+        }
+    }
+
     let Some(messages) = envelope.get("messages").and_then(|m| m.as_array()) else {
         return;
     };
