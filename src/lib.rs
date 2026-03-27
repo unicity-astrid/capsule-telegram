@@ -69,6 +69,8 @@ struct TurnState {
 /// Pending approval waiting for a callback button press.
 struct PendingApproval {
     chat_id: i64,
+    /// Full request_id (the callback_data may use a truncated token).
+    full_request_id: String,
     /// When this approval was created (for TTL-based cleanup).
     created_at: Instant,
 }
@@ -178,6 +180,9 @@ impl TelegramBot {
             }
 
             // Phase B: poll IPC events and push to Telegram.
+            // Track whether all handles succeeded this pass; only count
+            // consecutive errors when an entire pass fails.
+            let mut ipc_pass_ok = true;
             for handle in &sub_handles {
                 match ipc::poll_bytes(handle) {
                     Ok(bytes) if !bytes.is_empty() => {
@@ -191,22 +196,23 @@ impl TelegramBot {
                             &mut pending_elicitations,
                         );
                     }
-                    Ok(_) => {
-                        // Empty poll — reset error counter (subscription is healthy).
-                        consecutive_ipc_errors = 0;
-                    }
+                    Ok(_) => {}
                     Err(e) => {
-                        consecutive_ipc_errors = consecutive_ipc_errors.saturating_add(1);
+                        ipc_pass_ok = false;
                         let _ = log::error(format!("IPC poll error: {e:?}"));
-                        if consecutive_ipc_errors >= 50 {
-                            let _ = log::error(
-                                "Too many consecutive IPC errors — shutting down",
-                            );
-                            return Err(SysError::ApiError(
-                                "IPC subscription failed, capsule terminated".into(),
-                            ));
-                        }
                     }
+                }
+            }
+            if ipc_pass_ok {
+                consecutive_ipc_errors = 0;
+            } else {
+                consecutive_ipc_errors = consecutive_ipc_errors.saturating_add(1);
+                if consecutive_ipc_errors >= 50 {
+                    let _ =
+                        log::error("Too many consecutive IPC errors — shutting down");
+                    return Err(SysError::ApiError(
+                        "IPC subscription failed, capsule terminated".into(),
+                    ));
                 }
             }
 
@@ -315,13 +321,9 @@ fn handle_message(
         return;
     }
 
-    // Bot commands.
-    if text.starts_with('/') {
-        handle_command(token, chat_id, text, sessions, session_to_chat, turns);
-        return;
-    }
-
     // Check if this is a reply to a pending text-based elicitation.
+    // This must come before command parsing so replies starting with "/"
+    // (common for paths/secrets) are not treated as bot commands.
     if let Some(eli) = pending_elicitations.remove(&chat_id) {
         let payload = serde_json::json!({
             "type": "elicit_response",
@@ -329,7 +331,27 @@ fn handle_message(
             "value": text,
         });
         let topic = format!("astrid.v1.elicit.response.{}", eli.request_id);
-        let _ = ipc::publish_json(&topic, &payload);
+        if let Err(e) = ipc::publish_json(&topic, &payload) {
+            let _ = log::error(format!(
+                "Failed to publish elicitation response for {}: {e:?}",
+                eli.request_id,
+            ));
+            // Re-insert so the user can retry.
+            pending_elicitations.insert(chat_id, eli);
+            let _ = telegram::send_message(
+                token,
+                chat_id,
+                "Failed to send your response. Please try again.",
+                None,
+                None,
+            );
+        }
+        return;
+    }
+
+    // Bot commands.
+    if text.starts_with('/') {
+        handle_command(token, chat_id, text, sessions, session_to_chat, turns);
         return;
     }
 
@@ -472,15 +494,17 @@ fn handle_callback(
 
     match parts[0] {
         "apr" => {
-            let request_id = parts[1];
+            let token_key = parts[1];
             let decision = parts[2];
-            if let Some(approval) = pending_approvals.remove(request_id) {
+            if let Some(approval) = pending_approvals.remove(token_key) {
+                // Use the full request_id (not the possibly truncated callback token).
+                let full_id = &approval.full_request_id;
                 let payload = serde_json::json!({
                     "type": "approval_response",
-                    "request_id": request_id,
+                    "request_id": full_id,
                     "decision": decision,
                 });
-                let topic = format!("astrid.v1.approval.response.{request_id}");
+                let topic = format!("astrid.v1.approval.response.{full_id}");
                 let _ = ipc::publish_json(&topic, &payload);
                 let _ = telegram::answer_callback_query(
                     token,
@@ -822,6 +846,7 @@ fn handle_approval_request(
         rid.to_string(),
         PendingApproval {
             chat_id,
+            full_request_id: request_id.to_string(),
             created_at: Instant::now(),
         },
     );
