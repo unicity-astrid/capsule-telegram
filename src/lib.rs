@@ -478,9 +478,9 @@ fn handle_ipc_event(
                 .unwrap_or("");
             let reason = payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
 
-            // Find which chat this approval belongs to by checking active turns.
-            let chat_id = find_chat_for_event(session_to_chat, sessions, turns);
-            let Some(chat_id) = chat_id else { return };
+            let Some(chat_id) = resolve_chat_from_payload(payload, session_to_chat, turns) else {
+                return;
+            };
 
             handle_approval_request(
                 token,
@@ -502,8 +502,9 @@ fn handle_ipc_event(
                 .unwrap_or("");
             let field = payload.get("field");
 
-            let chat_id = find_chat_for_event(session_to_chat, sessions, turns);
-            let Some(chat_id) = chat_id else { return };
+            let Some(chat_id) = resolve_chat_from_payload(payload, session_to_chat, turns) else {
+                return;
+            };
 
             handle_elicitation_request(token, chat_id, request_id, field);
         }
@@ -705,6 +706,33 @@ fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Resolve the target chat from an IPC event payload.
+///
+/// - If `session_id` is present in the payload, look it up in `session_to_chat`.
+///   If the lookup fails (unknown or stale session), return `None` so the event
+///   is dropped rather than misrouted.
+/// - If `session_id` is absent, fall back to the single-active-turn heuristic:
+///   return the only active chat when exactly one turn is in progress.
+fn resolve_chat_from_payload(
+    payload: &Value,
+    session_to_chat: &HashMap<String, i64>,
+    turns: &HashMap<i64, TurnState>,
+) -> Option<i64> {
+    match payload.get("session_id") {
+        Some(session_val) => {
+            let sid = session_val.as_str()?;
+            session_to_chat.get(sid).copied()
+        }
+        None => {
+            if turns.len() == 1 {
+                turns.keys().next().copied()
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
     let html = format::md_to_telegram_html(&turn.text_buffer);
     let chunks = format::chunk_html(&html, 4000);
@@ -718,23 +746,6 @@ fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
         }
     }
     turn.finalized = true;
-}
-
-/// Find a chat that has an active turn (best-effort for events missing
-/// session_id). Prefers the only active turn if there's exactly one.
-fn find_chat_for_event(
-    session_to_chat: &HashMap<String, i64>,
-    _sessions: &HashMap<i64, String>,
-    turns: &HashMap<i64, TurnState>,
-) -> Option<i64> {
-    // If only one turn is active, it must be for the event.
-    if turns.len() == 1 {
-        return turns.keys().next().copied();
-    }
-    // Multiple turns active — can't disambiguate without session_id.
-    // This is a limitation; the event should ideally carry a session_id.
-    let _ = session_to_chat;
-    None
 }
 
 fn is_user_allowed(allowed: &[i64], user_id: Option<i64>) -> bool {
