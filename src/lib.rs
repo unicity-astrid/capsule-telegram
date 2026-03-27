@@ -26,7 +26,9 @@ const EDIT_THROTTLE: Duration = Duration::from_millis(500);
 /// event processing between polls.
 const POLL_TIMEOUT: u32 = 1;
 
-/// Maximum age before an in-progress turn is considered stale and cleaned up.
+/// Maximum inactivity before an in-progress turn is considered stale and
+/// cleaned up. The timer resets on every stream delta or approval event, so
+/// long-running turns with ongoing activity are not prematurely reaped.
 const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum age before a pending approval is considered stale and cleaned up.
@@ -51,8 +53,13 @@ struct TurnState {
     last_edit: Instant,
     /// Whether the current message has been finalized (e.g. before a tool).
     finalized: bool,
-    /// When this turn was created (for timeout-based cleanup).
+    /// When this turn was created.
+    #[allow(dead_code)]
     created_at: Instant,
+    /// Last time activity was observed (stream delta or approval received).
+    /// Used for timeout so that long-running turns with ongoing activity are
+    /// not prematurely reaped.
+    last_activity: Instant,
 }
 
 /// Pending approval waiting for a callback button press.
@@ -162,8 +169,20 @@ impl TelegramBot {
             }
 
             // Phase C: clean up stale turns and expired approvals.
-            turns.retain(|chat_id, turn| {
-                if turn.created_at.elapsed() > TURN_TIMEOUT {
+            //
+            // Collect expired entries first so that Telegram API calls are
+            // not made inside the `retain` closure while holding a mutable
+            // borrow on `turns`.
+            let expired_turns: Vec<(i64, i64)> = turns
+                .iter()
+                .filter(|(_, turn)| turn.last_activity.elapsed() > TURN_TIMEOUT)
+                .map(|(&chat_id, turn)| (chat_id, turn.msg_id))
+                .collect();
+
+            if !expired_turns.is_empty() {
+                turns.retain(|_, turn| turn.last_activity.elapsed() <= TURN_TIMEOUT);
+
+                for (chat_id, msg_id) in &expired_turns {
                     let _ = log::warn(format!(
                         "Turn for chat {chat_id} timed out after {}s — cleaning up",
                         TURN_TIMEOUT.as_secs()
@@ -171,15 +190,12 @@ impl TelegramBot {
                     let _ = telegram::edit_message_text(
                         &bot_token,
                         *chat_id,
-                        turn.msg_id,
+                        *msg_id,
                         "Turn timed out.",
                         None,
                     );
-                    false
-                } else {
-                    true
                 }
-            });
+            }
 
             pending_approvals.retain(|request_id, approval| {
                 if approval.created_at.elapsed() > APPROVAL_TTL {
@@ -274,16 +290,18 @@ fn handle_message(
     let _ = telegram::send_typing(token, chat_id);
 
     // Start turn tracking.
+    let now = Instant::now();
     turns.insert(
         chat_id,
         TurnState {
             msg_id: placeholder.message_id,
             text_buffer: String::new(),
-            last_edit: Instant::now()
+            last_edit: now
                 .checked_sub(EDIT_THROTTLE)
                 .unwrap_or_else(Instant::now),
             finalized: false,
-            created_at: Instant::now(),
+            created_at: now,
+            last_activity: now,
         },
     );
 
@@ -569,7 +587,12 @@ fn handle_ipc_event(
     }
 }
 
-fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMap<i64, TurnState>) {
+fn handle_stream_delta(
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    turns: &mut HashMap<i64, TurnState>,
+) {
     if text.is_empty() {
         return;
     }
@@ -579,6 +602,7 @@ fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMa
     };
 
     turn.text_buffer.push_str(text);
+    turn.last_activity = Instant::now();
 
     if turn.last_edit.elapsed() >= EDIT_THROTTLE && !turn.text_buffer.is_empty() {
         let html = format::md_to_telegram_html(&turn.text_buffer);
@@ -662,8 +686,9 @@ fn handle_approval_request(
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
 ) {
-    // Flush any in-progress text.
+    // Flush any in-progress text and bump activity timestamp.
     if let Some(turn) = turns.get_mut(&chat_id) {
+        turn.last_activity = Instant::now();
         if !turn.text_buffer.is_empty() && !turn.finalized {
             finalize_turn_text(token, chat_id, turn);
         }
@@ -703,7 +728,12 @@ fn handle_approval_request(
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
 }
 
-fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field: Option<&Value>) {
+fn handle_elicitation_request(
+    token: &str,
+    chat_id: i64,
+    request_id: &str,
+    field: Option<&Value>,
+) {
     let prompt = field
         .and_then(|f| f.get("prompt"))
         .and_then(|p| p.as_str())
