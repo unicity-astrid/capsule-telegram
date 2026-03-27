@@ -4,20 +4,35 @@
 //! synchronous (WASM single-threaded).
 
 use astrid_sdk::prelude::*;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{InlineKeyboardMarkup, TgMessage, TgResponse, Update};
 
 const BASE_URL: &str = "https://api.telegram.org";
 
-/// Parse a Telegram API response, mapping `ok: false` to an error.
+/// The SDK's `http::send()` returns a JSON envelope wrapping the actual
+/// HTTP response.
+#[derive(Deserialize)]
+struct HttpEnvelope {
+    #[allow(dead_code)]
+    status: u16,
+    body: String,
+}
+
+/// Parse a Telegram API response from the SDK's HTTP envelope.
 fn parse_response<T: serde::de::DeserializeOwned>(
     resp: http::Response,
     method: &str,
 ) -> Result<T, SysError> {
-    let parsed: TgResponse<T> = resp
+    // First: unwrap the SDK envelope to get the actual HTTP body.
+    let envelope: HttpEnvelope = resp
         .json()
-        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse response: {e}")))?;
+        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse HTTP envelope: {e}")))?;
+
+    // Second: parse the Telegram JSON from the body string.
+    let parsed: TgResponse<T> = serde_json::from_str(&envelope.body)
+        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse Telegram response: {e}")))?;
 
     if !parsed.ok {
         return Err(SysError::ApiError(format!(
@@ -91,14 +106,17 @@ pub fn edit_message_text(
     let req = http::Request::post(&url).json(&body)?;
     let resp = http::send(&req)?;
 
+    let envelope: HttpEnvelope = resp
+        .json()
+        .map_err(|e| SysError::ApiError(format!("editMessageText: envelope parse error: {e}")))?;
+
     // Telegram returns "message is not modified" when text is unchanged —
     // not a real error for our throttled-edit pattern.
-    let body_text = resp.text().unwrap_or("");
-    if body_text.contains("message is not modified") {
+    if envelope.body.contains("message is not modified") {
         return Ok(());
     }
 
-    let parsed: TgResponse<serde_json::Value> = serde_json::from_str(body_text)
+    let parsed: TgResponse<serde_json::Value> = serde_json::from_str(&envelope.body)
         .map_err(|e| SysError::ApiError(format!("editMessageText: parse error: {e}")))?;
 
     if !parsed.ok {
