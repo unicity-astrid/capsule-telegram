@@ -875,6 +875,18 @@ fn handle_approval_request(
     // from naive prefix truncation.
     let cb_token = callback_token(request_id);
 
+    // Detect (extremely unlikely) hash collision: if the token already maps
+    // to a different request_id, log and evict the old entry rather than
+    // silently overwriting it.
+    if let Some(existing) = pending_approvals.get(&cb_token) {
+        if existing.full_request_id != request_id {
+            let _ = log::warn(format!(
+                "Callback token collision: '{}' maps to both '{}' and '{}'",
+                cb_token, existing.full_request_id, request_id,
+            ));
+        }
+    }
+
     pending_approvals.insert(
         cb_token.clone(),
         PendingApproval {
