@@ -108,34 +108,38 @@ impl TelegramBot {
 
         // ── Main loop ───────────────────────────────────────────────────
         let mut consecutive_errors: u32 = 0;
+        let mut next_poll_at = Instant::now();
 
         loop {
-            // Phase A: poll Telegram for new updates.
-            match telegram::get_updates(&bot_token, offset, POLL_TIMEOUT) {
-                Ok(updates) => {
-                    consecutive_errors = 0;
-                    for update in updates {
-                        offset = update.update_id + 1;
-                        handle_telegram_update(
-                            &bot_token,
-                            &allowed_users,
-                            &update,
-                            &mut sessions,
-                            &mut session_to_chat,
-                            &mut turns,
-                            &mut pending_approvals,
-                        );
+            // Phase A: poll Telegram for new updates (skip if backing off).
+            if Instant::now() >= next_poll_at {
+                match telegram::get_updates(&bot_token, offset, POLL_TIMEOUT) {
+                    Ok(updates) => {
+                        consecutive_errors = 0;
+                        next_poll_at = Instant::now();
+                        for update in updates {
+                            offset = update.update_id + 1;
+                            handle_telegram_update(
+                                &bot_token,
+                                &allowed_users,
+                                &update,
+                                &mut sessions,
+                                &mut session_to_chat,
+                                &mut turns,
+                                &mut pending_approvals,
+                            );
+                        }
+                        let _ = kv::set_json(KV_OFFSET, &offset);
                     }
-                    let _ = kv::set_json(KV_OFFSET, &offset);
-                }
-                Err(e) => {
-                    consecutive_errors = consecutive_errors.saturating_add(1);
-                    let backoff_secs = 2u64.pow(consecutive_errors.min(6)).min(60);
-                    let _ = log::warn(format!(
-                        "Telegram poll error: {e:?} — backing off {backoff_secs}s \
-                         (consecutive errors: {consecutive_errors})"
-                    ));
-                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                    Err(e) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        let backoff_secs = 2u64.pow(consecutive_errors.min(6)).min(60);
+                        let _ = log::warn(format!(
+                            "Telegram poll error: {e:?} — backing off {backoff_secs}s \
+                             (consecutive errors: {consecutive_errors})"
+                        ));
+                        next_poll_at = Instant::now() + Duration::from_secs(backoff_secs);
+                    }
                 }
             }
 
@@ -158,6 +162,9 @@ impl TelegramBot {
                     _ => {}
                 }
             }
+
+            // Avoid busy-spinning when Telegram polling is skipped during backoff.
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
