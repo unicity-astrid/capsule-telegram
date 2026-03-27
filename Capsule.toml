@@ -9,6 +9,7 @@ astrid-version = ">=0.5.0"
 id = "telegram"
 file = "astrid_capsule_telegram.wasm"
 type = "executable"
+capabilities = { net = ["*"] }
 
 [capabilities]
 uplink = true
