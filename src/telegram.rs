@@ -15,7 +15,6 @@ const BASE_URL: &str = "https://api.telegram.org";
 /// HTTP response.
 #[derive(Deserialize)]
 struct HttpEnvelope {
-    #[allow(dead_code)]
     status: u16,
     body: String,
 }
@@ -29,6 +28,42 @@ fn parse_response<T: serde::de::DeserializeOwned>(
     let envelope: HttpEnvelope = resp
         .json()
         .map_err(|e| SysError::ApiError(format!("{method}: failed to parse HTTP envelope: {e}")))?;
+
+    // Check HTTP status before attempting to parse the Telegram response.
+    if envelope.status == 429 {
+        return Err(SysError::ApiError(format!(
+            "{method}: Rate limited by Telegram API"
+        )));
+    }
+    if envelope.status >= 500 {
+        let truncated = if envelope.body.len() > 200 {
+            format!("{}...", &envelope.body[..200])
+        } else {
+            envelope.body.clone()
+        };
+        return Err(SysError::ApiError(format!(
+            "{method}: server error {}: {truncated}",
+            envelope.status
+        )));
+    }
+    if envelope.status >= 400 {
+        // Try to extract the Telegram error description from the response body.
+        if let Ok(err_resp) = serde_json::from_str::<TgResponse<serde_json::Value>>(&envelope.body)
+        {
+            if !err_resp.ok {
+                return Err(SysError::ApiError(format!(
+                    "{method}: {}",
+                    err_resp
+                        .description
+                        .unwrap_or_else(|| format!("HTTP {}", envelope.status)),
+                )));
+            }
+        }
+        return Err(SysError::ApiError(format!(
+            "{method}: HTTP {}",
+            envelope.status
+        )));
+    }
 
     // Second: parse the Telegram JSON from the body string.
     let parsed: TgResponse<T> = serde_json::from_str(&envelope.body)

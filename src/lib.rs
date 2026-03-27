@@ -77,7 +77,7 @@ impl TelegramBot {
         }
 
         // ── Register uplink ─────────────────────────────────────────────
-        let _ = uplink::register("telegram", "telegram", "interactive");
+        uplink::register("telegram", "telegram", "interactive")?;
 
         // ── Subscribe to IPC topics ─────────────────────────────────────
         let topics = [
@@ -406,6 +406,14 @@ fn handle_ipc_poll(
         Ok(v) => v,
         Err(_) => return,
     };
+
+    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64()) {
+        if dropped > 0 {
+            let _ = log::warn(format!(
+                "IPC bus dropped {dropped} messages — responses may be stale"
+            ));
+        }
+    }
 
     let Some(messages) = envelope.get("messages").and_then(|m| m.as_array()) else {
         return;
