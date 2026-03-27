@@ -77,7 +77,7 @@ pub fn md_to_telegram_html(md: &str) -> String {
             let escaped_url = html_escape(&url);
             format!("<a href=\"{escaped_url}\">{label}</a>")
         } else {
-            format!("{label} ({url})")
+            format!("{label} ({})", html_escape(&url))
         }
     });
     let text = HEADING.replace_all(&text, "<b>$1</b>");
