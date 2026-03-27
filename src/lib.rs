@@ -325,16 +325,16 @@ fn handle_message(
     // This must come before command parsing so replies starting with "/"
     // (common for paths/secrets) are not treated as bot commands.
     if let Some(eli) = pending_elicitations.remove(&chat_id) {
+        let req_id = eli.request_id.clone();
         let payload = serde_json::json!({
             "type": "elicit_response",
-            "request_id": eli.request_id,
+            "request_id": req_id,
             "value": text,
         });
-        let topic = format!("astrid.v1.elicit.response.{}", eli.request_id);
+        let topic = format!("astrid.v1.elicit.response.{req_id}");
         if let Err(e) = ipc::publish_json(&topic, &payload) {
             let _ = log::error(format!(
-                "Failed to publish elicitation response for {}: {e:?}",
-                eli.request_id,
+                "Failed to publish elicitation response for {req_id}: {e:?}",
             ));
             // Re-insert so the user can retry.
             pending_elicitations.insert(chat_id, eli);
