@@ -478,20 +478,9 @@ fn handle_ipc_event(
                 .unwrap_or("");
             let reason = payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
 
-            // Resolve the target chat: prefer session_id from payload, fall back
-            // to the single active turn when no session_id is present.
-            let chat_id = payload
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .and_then(|sid| session_to_chat.get(sid).copied())
-                .or_else(|| {
-                    if turns.len() == 1 {
-                        turns.keys().next().copied()
-                    } else {
-                        None
-                    }
-                });
-            let Some(chat_id) = chat_id else { return };
+            let Some(chat_id) = resolve_chat_from_payload(payload, session_to_chat, turns) else {
+                return;
+            };
 
             handle_approval_request(
                 token,
@@ -513,20 +502,9 @@ fn handle_ipc_event(
                 .unwrap_or("");
             let field = payload.get("field");
 
-            // Resolve the target chat: prefer session_id from payload, fall back
-            // to the single active turn when no session_id is present.
-            let chat_id = payload
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .and_then(|sid| session_to_chat.get(sid).copied())
-                .or_else(|| {
-                    if turns.len() == 1 {
-                        turns.keys().next().copied()
-                    } else {
-                        None
-                    }
-                });
-            let Some(chat_id) = chat_id else { return };
+            let Some(chat_id) = resolve_chat_from_payload(payload, session_to_chat, turns) else {
+                return;
+            };
 
             handle_elicitation_request(token, chat_id, request_id, field);
         }
@@ -727,6 +705,33 @@ fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Resolve the target chat from an IPC event payload.
+///
+/// - If `session_id` is present in the payload, look it up in `session_to_chat`.
+///   If the lookup fails (unknown or stale session), return `None` so the event
+///   is dropped rather than misrouted.
+/// - If `session_id` is absent, fall back to the single-active-turn heuristic:
+///   return the only active chat when exactly one turn is in progress.
+fn resolve_chat_from_payload(
+    payload: &Value,
+    session_to_chat: &HashMap<String, i64>,
+    turns: &HashMap<i64, TurnState>,
+) -> Option<i64> {
+    match payload.get("session_id") {
+        Some(session_val) => {
+            let sid = session_val.as_str()?;
+            session_to_chat.get(sid).copied()
+        }
+        None => {
+            if turns.len() == 1 {
+                turns.keys().next().copied()
+            } else {
+                None
+            }
+        }
+    }
+}
 
 fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
     let html = format::md_to_telegram_html(&turn.text_buffer);
