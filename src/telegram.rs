@@ -97,10 +97,15 @@ fn parse_response<T: serde::de::DeserializeOwned>(
 /// Uses long polling with the given timeout (seconds). A timeout of 0 returns
 /// immediately (non-blocking poll).
 pub fn get_updates(token: &str, offset: i64, timeout: u32) -> Result<Vec<Update>, SysError> {
-    let url = format!(
-        "{BASE_URL}/bot{token}/getUpdates?offset={offset}&timeout={timeout}&allowed_updates=[\"message\",\"callback_query\"]"
-    );
-    let req = http::Request::get(&url);
+    // Use POST with JSON body to avoid URL-encoding issues with
+    // allowed_updates array (brackets/quotes violate RFC 3986 in query params).
+    let url = format!("{BASE_URL}/bot{token}/getUpdates");
+    let body = serde_json::json!({
+        "offset": offset,
+        "timeout": timeout,
+        "allowed_updates": ["message", "callback_query"],
+    });
+    let req = http::Request::post(&url).json(&body)?;
     let resp = http::send(&req)?;
     parse_response(resp, "getUpdates")
 }

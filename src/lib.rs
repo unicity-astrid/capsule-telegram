@@ -31,8 +31,12 @@ const POLL_TIMEOUT: u32 = 1;
 /// long-running turns with ongoing activity are not prematurely reaped.
 const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum age before a pending approval is considered stale and cleaned up.
+/// Maximum age before a pending approval/elicitation is considered stale.
 const APPROVAL_TTL: Duration = Duration::from_secs(300);
+
+/// Maximum accumulated text buffer size (bytes) during streaming. Prevents
+/// unbounded memory growth from very long agent responses in WASM.
+const MAX_TEXT_BUFFER: usize = 256 * 1024;
 
 /// KV key for the last processed Telegram update offset.
 const KV_OFFSET: &str = "tg.offset";
@@ -53,7 +57,7 @@ struct TurnState {
     last_edit: Instant,
     /// Whether the current message has been finalized (e.g. before a tool).
     finalized: bool,
-    /// When this turn was created.
+    /// When this turn was created (kept for diagnostics).
     #[allow(dead_code)]
     created_at: Instant,
     /// Last time activity was observed (stream delta or approval received).
@@ -66,6 +70,13 @@ struct TurnState {
 struct PendingApproval {
     chat_id: i64,
     /// When this approval was created (for TTL-based cleanup).
+    created_at: Instant,
+}
+
+/// Pending text-based elicitation waiting for the user to reply.
+struct PendingElicitation {
+    request_id: String,
+    /// When this elicitation was created (for TTL-based cleanup).
     created_at: Instant,
 }
 
@@ -118,6 +129,8 @@ impl TelegramBot {
             .collect();
         let mut turns: HashMap<i64, TurnState> = HashMap::new();
         let mut pending_approvals: HashMap<String, PendingApproval> = HashMap::new();
+        let mut pending_elicitations: HashMap<i64, PendingElicitation> = HashMap::new();
+        let mut consecutive_ipc_errors: u32 = 0;
 
         let _ = log::info("Telegram bot started");
 
@@ -142,9 +155,15 @@ impl TelegramBot {
                                 &mut session_to_chat,
                                 &mut turns,
                                 &mut pending_approvals,
+                                &mut pending_elicitations,
                             );
                         }
-                        let _ = kv::set_json(KV_OFFSET, &offset);
+                        if let Err(e) = kv::set_json(KV_OFFSET, &offset) {
+                            let _ = log::warn(format!(
+                                "Failed to persist poll offset: {e:?} — \
+                                 restart may reprocess recent updates"
+                            ));
+                        }
                     }
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -162,6 +181,7 @@ impl TelegramBot {
             for handle in &sub_handles {
                 match ipc::poll_bytes(handle) {
                     Ok(bytes) if !bytes.is_empty() => {
+                        consecutive_ipc_errors = 0;
                         handle_ipc_poll(
                             &bot_token,
                             &bytes,
@@ -169,30 +189,37 @@ impl TelegramBot {
                             &sessions,
                             &mut turns,
                             &mut pending_approvals,
+                            &mut pending_elicitations,
                         );
                     }
                     Err(e) => {
+                        consecutive_ipc_errors = consecutive_ipc_errors.saturating_add(1);
                         let _ = log::error(format!("IPC poll error: {e:?}"));
+                        if consecutive_ipc_errors >= 50 {
+                            let _ = log::error(
+                                "Too many consecutive IPC errors — shutting down",
+                            );
+                            return Err(SysError::ApiError(
+                                "IPC subscription failed, capsule terminated".into(),
+                            ));
+                        }
                     }
                     _ => {}
                 }
             }
 
-            // Phase C: clean up stale turns and expired approvals.
+            // Phase C: clean up stale turns, approvals, and elicitations.
             //
-            // Collect expired entries first so that Telegram API calls are
-            // not made inside the `retain` closure while holding a mutable
-            // borrow on `turns`.
-            let expired_turns: Vec<(i64, i64)> = turns
+            // Collect expired chat_ids first, then remove by key to avoid
+            // TOCTOU races from double elapsed() checks.
+            let expired_turn_ids: Vec<i64> = turns
                 .iter()
                 .filter(|(_, turn)| turn.last_activity.elapsed() > TURN_TIMEOUT)
-                .map(|(&chat_id, turn)| (chat_id, turn.msg_id))
+                .map(|(&chat_id, _)| chat_id)
                 .collect();
 
-            if !expired_turns.is_empty() {
-                turns.retain(|_, turn| turn.last_activity.elapsed() <= TURN_TIMEOUT);
-
-                for (chat_id, msg_id) in &expired_turns {
+            for chat_id in &expired_turn_ids {
+                if let Some(turn) = turns.remove(chat_id) {
                     let _ = log::warn(format!(
                         "Turn for chat {chat_id} timed out after {}s — cleaning up",
                         TURN_TIMEOUT.as_secs()
@@ -200,7 +227,7 @@ impl TelegramBot {
                     let _ = telegram::edit_message_text(
                         &bot_token,
                         *chat_id,
-                        *msg_id,
+                        turn.msg_id,
                         "Turn timed out.",
                         None,
                     );
@@ -210,9 +237,8 @@ impl TelegramBot {
             pending_approvals.retain(|request_id, approval| {
                 if approval.created_at.elapsed() > APPROVAL_TTL {
                     let _ = log::warn(format!(
-                        "Approval {request_id} for chat {} expired after {}s — cleaning up",
+                        "Approval {request_id} for chat {} expired — cleaning up",
                         approval.chat_id,
-                        APPROVAL_TTL.as_secs()
                     ));
                     false
                 } else {
@@ -220,8 +246,23 @@ impl TelegramBot {
                 }
             });
 
-            // Avoid busy-spinning when Telegram polling is skipped during backoff.
-            std::thread::sleep(Duration::from_millis(50));
+            pending_elicitations.retain(|chat_id, eli| {
+                if eli.created_at.elapsed() > APPROVAL_TTL {
+                    let _ = log::warn(format!(
+                        "Elicitation {} for chat {chat_id} expired — cleaning up",
+                        eli.request_id,
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Only sleep when we skipped the Telegram poll (during backoff).
+            // During normal operation the 1s long-poll provides natural pacing.
+            if Instant::now() < next_poll_at {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -236,12 +277,21 @@ fn handle_telegram_update(
     session_to_chat: &mut HashMap<String, i64>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
     if let Some(msg) = &update.message {
-        handle_message(token, allowed_users, msg, sessions, session_to_chat, turns);
+        handle_message(
+            token,
+            allowed_users,
+            msg,
+            sessions,
+            session_to_chat,
+            turns,
+            pending_elicitations,
+        );
     }
     if let Some(cb) = &update.callback_query {
-        handle_callback(token, allowed_users, cb, sessions, pending_approvals);
+        handle_callback(token, allowed_users, cb, sessions, pending_approvals, pending_elicitations);
     }
 }
 
@@ -252,6 +302,7 @@ fn handle_message(
     sessions: &mut HashMap<i64, String>,
     session_to_chat: &mut HashMap<String, i64>,
     turns: &mut HashMap<i64, TurnState>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
     let chat_id = msg.chat.id;
     let Some(text) = &msg.text else { return };
@@ -265,6 +316,18 @@ fn handle_message(
     // Bot commands.
     if text.starts_with('/') {
         handle_command(token, chat_id, text, sessions, session_to_chat, turns);
+        return;
+    }
+
+    // Check if this is a reply to a pending text-based elicitation.
+    if let Some(eli) = pending_elicitations.remove(&chat_id) {
+        let payload = serde_json::json!({
+            "type": "elicit_response",
+            "request_id": eli.request_id,
+            "value": text,
+        });
+        let topic = format!("astrid.v1.elicit.response.{}", eli.request_id);
+        let _ = ipc::publish_json(&topic, &payload);
         return;
     }
 
@@ -383,8 +446,9 @@ fn handle_callback(
     token: &str,
     allowed_users: &[i64],
     cb: &types::CallbackQuery,
-    sessions: &HashMap<i64, String>,
+    _sessions: &HashMap<i64, String>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
     // Access control.
     if !is_user_allowed(allowed_users, Some(cb.from.id)) {
@@ -428,7 +492,7 @@ fn handle_callback(
                         token,
                         approval.chat_id,
                         msg.message_id,
-                        &format!("Approval: <b>{decision}</b>"),
+                        &format!("Approval: <b>{}</b>", format::html_escape(decision)),
                         Some("HTML"),
                     );
                 }
@@ -441,10 +505,18 @@ fn handle_callback(
             let value = parts[2];
             let chat_id = cb.message.as_ref().map(|m| m.chat.id);
 
-            // Find session for this chat.
-            let session_id = chat_id.and_then(|cid| sessions.get(&cid));
+            // Validate: the elicitation must be pending for this chat.
+            let is_valid = chat_id.is_some_and(|cid| {
+                pending_elicitations
+                    .get(&cid)
+                    .is_some_and(|e| e.request_id == request_id)
+            });
 
-            if session_id.is_some() {
+            if is_valid {
+                // Remove the pending elicitation (consumed).
+                if let Some(cid) = chat_id {
+                    pending_elicitations.remove(&cid);
+                }
                 let payload = serde_json::json!({
                     "type": "elicit_response",
                     "request_id": request_id,
@@ -458,7 +530,8 @@ fn handle_callback(
                     Some(&format!("Selected: {value}")),
                 );
             } else {
-                let _ = telegram::answer_callback_query(token, &cb.id, Some("No active session"));
+                let _ =
+                    telegram::answer_callback_query(token, &cb.id, Some("Elicitation expired"));
             }
         }
         _ => {
@@ -476,6 +549,7 @@ fn handle_ipc_poll(
     sessions: &HashMap<i64, String>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
     let envelope: Value = match serde_json::from_slice(poll_bytes) {
         Ok(v) => v,
@@ -508,6 +582,7 @@ fn handle_ipc_poll(
             sessions,
             turns,
             pending_approvals,
+            pending_elicitations,
         );
     }
 }
@@ -520,6 +595,7 @@ fn handle_ipc_event(
     _sessions: &HashMap<i64, String>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
     let event_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -588,7 +664,13 @@ fn handle_ipc_event(
                 return;
             };
 
-            handle_elicitation_request(token, chat_id, request_id, field);
+            handle_elicitation_request(
+                token,
+                chat_id,
+                request_id,
+                field,
+                pending_elicitations,
+            );
         }
 
         // Catch-all for stream deltas that use a different topic pattern.
@@ -617,7 +699,10 @@ fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMa
         return;
     };
 
-    turn.text_buffer.push_str(text);
+    // Cap buffer to prevent unbounded growth in WASM memory.
+    if turn.text_buffer.len() < MAX_TEXT_BUFFER {
+        turn.text_buffer.push_str(text);
+    }
     turn.last_activity = Instant::now();
 
     if turn.last_edit.elapsed() >= EDIT_THROTTLE && !turn.text_buffer.is_empty() {
@@ -720,26 +805,40 @@ fn handle_approval_request(
          <b>Reason:</b> {escaped_reason}"
     );
 
+    // Truncate request_id if needed to fit within Telegram's 64-byte
+    // callback_data limit. "apr:" + ":" + "allow_session" = 18 bytes overhead.
+    let rid = if request_id.len() > 46 {
+        &request_id[..46]
+    } else {
+        request_id
+    };
     let keyboard = telegram::inline_keyboard(vec![
-        ("Allow Once".into(), format!("apr:{request_id}:allow_once")),
+        ("Allow Once".into(), format!("apr:{rid}:allow_once")),
         (
             "Allow Session".into(),
-            format!("apr:{request_id}:allow_session"),
+            format!("apr:{rid}:allow_session"),
         ),
-        ("Deny".into(), format!("apr:{request_id}:deny")),
+        ("Deny".into(), format!("apr:{rid}:deny")),
     ]);
 
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
 }
 
-fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field: Option<&Value>) {
+fn handle_elicitation_request(
+    token: &str,
+    chat_id: i64,
+    request_id: &str,
+    field: Option<&Value>,
+    pending_elicitations: &mut HashMap<i64, PendingElicitation>,
+) {
     let prompt = field
         .and_then(|f| f.get("prompt"))
         .and_then(|p| p.as_str())
         .unwrap_or("Input required");
 
     // For enum-type fields (field_type is {"Enum": ["opt1", "opt2", ...]}),
-    // show inline keyboard with options.
+    // show inline keyboard with options. Truncate callback_data to respect
+    // Telegram's 64-byte limit.
     if let Some(options) = field
         .and_then(|f| f.get("field_type"))
         .and_then(|t| t.get("Enum"))
@@ -748,10 +847,29 @@ fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field
         let buttons: Vec<(String, String)> = options
             .iter()
             .filter_map(|o| o.as_str())
-            .map(|o| (o.to_string(), format!("eli:{request_id}:{o}")))
+            .filter_map(|o| {
+                let data = format!("eli:{request_id}:{o}");
+                // Telegram callback_data max is 64 bytes.
+                if data.len() <= 64 {
+                    Some((o.to_string(), data))
+                } else {
+                    let _ = log::warn(format!(
+                        "Elicitation option '{o}' exceeds 64-byte callback limit, skipping"
+                    ));
+                    None
+                }
+            })
             .collect();
 
         if !buttons.is_empty() {
+            // Track as pending so callbacks can be validated.
+            pending_elicitations.insert(
+                chat_id,
+                PendingElicitation {
+                    request_id: request_id.to_string(),
+                    created_at: Instant::now(),
+                },
+            );
             let keyboard = telegram::inline_keyboard(buttons);
             let _ = telegram::send_message(
                 token,
@@ -764,7 +882,16 @@ fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field
         }
     }
 
-    // For text/secret fields, just show the prompt. The user replies with text.
+    // For text/secret fields, register as pending so the next text message
+    // from this chat is routed as an elicitation response rather than a
+    // new agent turn.
+    pending_elicitations.insert(
+        chat_id,
+        PendingElicitation {
+            request_id: request_id.to_string(),
+            created_at: Instant::now(),
+        },
+    );
     let _ = telegram::send_message(
         token,
         chat_id,
@@ -845,16 +972,20 @@ fn session_kv_key(chat_id: i64) -> String {
 }
 
 fn save_session(chat_id: i64, session_id: &str) {
-    let _ = kv::set_json(
+    if let Err(e) = kv::set_json(
         &session_kv_key(chat_id),
         &SessionEntry {
             session_id: session_id.to_string(),
         },
-    );
+    ) {
+        let _ = log::warn(format!("Failed to persist session for chat {chat_id}: {e:?}"));
+    }
 }
 
 fn delete_session(chat_id: i64) {
-    let _ = kv::delete(&session_kv_key(chat_id));
+    if let Err(e) = kv::delete(&session_kv_key(chat_id)) {
+        let _ = log::warn(format!("Failed to delete session for chat {chat_id}: {e:?}"));
+    }
 }
 
 fn load_sessions() -> HashMap<i64, String> {
