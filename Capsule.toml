@@ -12,7 +12,7 @@ type = "executable"
 
 [capabilities]
 uplink = true
-net = ["https://api.telegram.org/*"]
+net = ["*"]
 ipc_publish = [
     "user.v1.prompt",
     "client.v1.disconnect",
