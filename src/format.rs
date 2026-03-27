@@ -15,6 +15,15 @@ pub fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Reverse common HTML entity escapes.
+fn html_unescape(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
 /// Convert LLM markdown to Telegram HTML.
 ///
 /// Handles: bold, italic, inline code, code blocks, links, headings.
@@ -57,13 +66,16 @@ pub fn md_to_telegram_html(md: &str) -> String {
     let text = ITALIC.replace_all(&text, "$1<i>$2</i>$3");
     let text = LINK.replace_all(&text, |caps: &regex::Captures<'_>| {
         let label = &caps[1];
-        let url = &caps[2];
+        // The URL has been HTML-escaped by the html_escape() call above,
+        // so we must unescape it before placing it inside href="...".
+        let url = html_unescape(&caps[2]);
         if url.starts_with("http://")
             || url.starts_with("https://")
             || url.starts_with("tg://")
             || url.starts_with("mailto:")
         {
-            format!("<a href=\"{url}\">{label}</a>")
+            let escaped_url = html_escape(&url);
+            format!("<a href=\"{escaped_url}\">{label}</a>")
         } else {
             format!("{label} ({url})")
         }
@@ -218,6 +230,12 @@ mod tests {
     }
 
     #[test]
+    fn html_unescape_roundtrip() {
+        let original = "<b>&test</b>";
+        assert_eq!(html_unescape(&html_escape(original)), original);
+    }
+
+    #[test]
     fn md_bold() {
         let result = md_to_telegram_html("Hello **world**");
         assert!(result.contains("<b>world</b>"));
@@ -239,6 +257,24 @@ mod tests {
     fn md_link_unsafe_scheme_rejected() {
         let result = md_to_telegram_html("Click [here](javascript:alert(1))");
         assert!(!result.contains("<a href"));
+    }
+
+    #[test]
+    fn md_link_url_not_double_escaped() {
+        let result = md_to_telegram_html("Visit [docs](https://example.com/search?a=1&b=2)");
+        // The href should contain properly escaped &amp; (single level), not &amp;amp;
+        assert!(
+            result.contains("href=\"https://example.com/search?a=1&amp;b=2\""),
+            "got: {result}"
+        );
+        // Must NOT contain double-escaped entities.
+        assert!(!result.contains("&amp;amp;"), "double-escaped: {result}");
+    }
+
+    #[test]
+    fn md_link_preserves_valid_url() {
+        let result = md_to_telegram_html("[click](https://example.com/path)");
+        assert!(result.contains("<a href=\"https://example.com/path\">click</a>"));
     }
 
     #[test]
