@@ -505,7 +505,19 @@ fn handle_callback(
                     "decision": decision,
                 });
                 let topic = format!("astrid.v1.approval.response.{full_id}");
-                let _ = ipc::publish_json(&topic, &payload);
+                if let Err(e) = ipc::publish_json(&topic, &payload) {
+                    let _ = log::error(format!(
+                        "Failed to publish approval response for {full_id}: {e:?}"
+                    ));
+                    // Re-insert so user can retry.
+                    pending_approvals.insert(token_key.to_string(), approval);
+                    let _ = telegram::answer_callback_query(
+                        token,
+                        &cb.id,
+                        Some("Failed to send decision. Try again."),
+                    );
+                    return;
+                }
                 let _ = telegram::answer_callback_query(
                     token,
                     &cb.id,
@@ -540,16 +552,28 @@ fn handle_callback(
 
             if is_valid {
                 // Remove the pending elicitation (consumed).
-                if let Some(cid) = chat_id {
-                    pending_elicitations.remove(&cid);
-                }
+                let removed = chat_id.and_then(|cid| pending_elicitations.remove(&cid));
                 let payload = serde_json::json!({
                     "type": "elicit_response",
                     "request_id": request_id,
                     "value": value,
                 });
                 let topic = format!("astrid.v1.elicit.response.{request_id}");
-                let _ = ipc::publish_json(&topic, &payload);
+                if let Err(e) = ipc::publish_json(&topic, &payload) {
+                    let _ = log::error(format!(
+                        "Failed to publish elicitation response for {request_id}: {e:?}"
+                    ));
+                    // Re-insert so user can retry.
+                    if let (Some(cid), Some(eli)) = (chat_id, removed) {
+                        pending_elicitations.insert(cid, eli);
+                    }
+                    let _ = telegram::answer_callback_query(
+                        token,
+                        &cb.id,
+                        Some("Failed to send selection. Try again."),
+                    );
+                    return;
+                }
                 let _ = telegram::answer_callback_query(
                     token,
                     &cb.id,
@@ -830,20 +854,15 @@ fn handle_approval_request(
          <b>Reason:</b> {escaped_reason}"
     );
 
-    // Truncate request_id if needed to fit within Telegram's 64-byte
-    // callback_data limit. "apr:" + ":" + "allow_session" = 18 bytes overhead.
-    // Use the same (possibly truncated) key for both the callback_data and the
-    // pending_approvals map so lookups match on button press.
-    let rid: &str = if request_id.len() > 46 {
-        // Truncate at a char boundary to avoid panic on multi-byte UTF-8.
-        let boundary = request_id.floor_char_boundary(46);
-        &request_id[..boundary]
-    } else {
-        request_id
-    };
+    // Generate a short callback token from the request_id to fit within
+    // Telegram's 64-byte callback_data limit ("apr:" + ":" + "allow_session"
+    // = 18 bytes overhead, leaving 46 bytes for the token). If the request_id
+    // already fits, use it directly; otherwise hash it to avoid collisions
+    // from naive prefix truncation.
+    let cb_token = callback_token(request_id);
 
     pending_approvals.insert(
-        rid.to_string(),
+        cb_token.clone(),
         PendingApproval {
             chat_id,
             full_request_id: request_id.to_string(),
@@ -852,12 +871,12 @@ fn handle_approval_request(
     );
 
     let keyboard = telegram::inline_keyboard(vec![
-        ("Allow Once".into(), format!("apr:{rid}:allow_once")),
+        ("Allow Once".into(), format!("apr:{cb_token}:allow_once")),
         (
             "Allow Session".into(),
-            format!("apr:{rid}:allow_session"),
+            format!("apr:{cb_token}:allow_session"),
         ),
-        ("Deny".into(), format!("apr:{rid}:deny")),
+        ("Deny".into(), format!("apr:{cb_token}:deny")),
     ]);
 
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
@@ -876,8 +895,8 @@ fn handle_elicitation_request(
         .unwrap_or("Input required");
 
     // For enum-type fields (field_type is {"Enum": ["opt1", "opt2", ...]}),
-    // show inline keyboard with options. Truncate callback_data to respect
-    // Telegram's 64-byte limit.
+    // show inline keyboard with options. Options whose callback_data exceeds
+    // Telegram's 64-byte limit are skipped with a warning.
     if let Some(options) = field
         .and_then(|f| f.get("field_type"))
         .and_then(|t| t.get("Enum"))
@@ -982,6 +1001,27 @@ fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
         }
     }
     turn.finalized = true;
+}
+
+/// Generate a short callback token from a request_id.
+///
+/// If the id fits in 46 bytes (leaving room for "apr:" + ":" + "allow_session"
+/// within Telegram's 64-byte callback_data limit), use it directly.
+/// Otherwise, produce a hex-encoded hash prefix that avoids collisions from
+/// naive string truncation.
+fn callback_token(request_id: &str) -> String {
+    const MAX_TOKEN_LEN: usize = 46;
+    if request_id.len() <= MAX_TOKEN_LEN {
+        request_id.to_string()
+    } else {
+        // Simple FNV-like hash to produce a short, collision-resistant token.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in request_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
 }
 
 fn is_user_allowed(allowed: &[i64], user_id: Option<i64>) -> bool {
@@ -1111,5 +1151,41 @@ mod tests {
         // Verify both session IDs are correctly formatted without relying on timing.
         assert!(a.starts_with("tg-1-"));
         assert!(b.starts_with("tg-1-"));
+    }
+
+    #[test]
+    fn callback_token_short_id_unchanged() {
+        let token = callback_token("short-req-123");
+        assert_eq!(token, "short-req-123");
+    }
+
+    #[test]
+    fn callback_token_long_id_hashed() {
+        let long_id = "a".repeat(100);
+        let token = callback_token(&long_id);
+        // Must fit in 46 bytes for callback_data.
+        assert!(token.len() <= 46, "token too long: {}", token.len());
+        // Must be a 16-char hex string.
+        assert_eq!(token.len(), 16);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn callback_token_distinct_ids_distinct_tokens() {
+        let a = callback_token(&"x".repeat(100));
+        let b = callback_token(&"y".repeat(100));
+        assert_ne!(a, b, "different ids should produce different tokens");
+    }
+
+    #[test]
+    fn callback_token_fits_in_callback_data() {
+        let long_id = "z".repeat(200);
+        let token = callback_token(&long_id);
+        let data = format!("apr:{token}:allow_session");
+        assert!(
+            data.len() <= 64,
+            "callback_data too long: {} bytes",
+            data.len()
+        );
     }
 }
