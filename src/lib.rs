@@ -60,18 +60,6 @@ pub struct TelegramBot;
 
 #[capsule]
 impl TelegramBot {
-    /// Elicit configuration during capsule installation.
-    #[astrid::install]
-    fn install(&self) -> Result<(), SysError> {
-        elicit::secret("bot_token", "Telegram Bot Token (from @BotFather)")?;
-        elicit::text_with_default(
-            "allowed_user_ids",
-            "Comma-separated Telegram user IDs (empty = unrestricted)",
-            "",
-        )?;
-        Ok(())
-    }
-
     /// Main run loop: poll Telegram and IPC in alternation.
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
