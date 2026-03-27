@@ -31,8 +31,8 @@ const POLL_TIMEOUT: u32 = 1;
 /// long-running turns with ongoing activity are not prematurely reaped.
 const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum age before a pending approval/elicitation is considered stale.
-const APPROVAL_TTL: Duration = Duration::from_secs(300);
+/// Maximum age before a pending approval or elicitation is considered stale.
+const PENDING_INTERACTION_TTL: Duration = Duration::from_secs(300);
 
 /// Maximum accumulated text buffer size (bytes) during streaming. Prevents
 /// unbounded memory growth from very long agent responses in WASM.
@@ -243,7 +243,7 @@ impl TelegramBot {
             }
 
             pending_approvals.retain(|_token, approval| {
-                if approval.created_at.elapsed() > APPROVAL_TTL {
+                if approval.created_at.elapsed() > PENDING_INTERACTION_TTL {
                     let _ = log::warn(format!(
                         "Approval {} for chat {} expired — cleaning up",
                         approval.full_request_id, approval.chat_id,
@@ -255,7 +255,7 @@ impl TelegramBot {
             });
 
             pending_elicitations.retain(|chat_id, eli| {
-                if eli.created_at.elapsed() > APPROVAL_TTL {
+                if eli.created_at.elapsed() > PENDING_INTERACTION_TTL {
                     let _ = log::warn(format!(
                         "Elicitation {} for chat {chat_id} expired — cleaning up",
                         eli.request_id,
