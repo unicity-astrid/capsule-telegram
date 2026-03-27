@@ -544,21 +544,29 @@ fn handle_callback(
             let chat_id = cb.message.as_ref().map(|m| m.chat.id);
 
             // Validate: the elicitation must be pending for this chat.
+            // The request_id in callback_data may be a token (hashed); the
+            // full request_id is stored in PendingElicitation.
             let is_valid = chat_id.is_some_and(|cid| {
-                pending_elicitations
-                    .get(&cid)
-                    .is_some_and(|e| e.request_id == request_id)
+                pending_elicitations.get(&cid).is_some_and(|e| {
+                    // Match either the full id or its callback token.
+                    request_id == e.request_id || request_id == callback_token(&e.request_id)
+                })
             });
 
             if is_valid {
                 // Remove the pending elicitation (consumed).
                 let removed = chat_id.and_then(|cid| pending_elicitations.remove(&cid));
+                // Use the full request_id for IPC, not the callback token.
+                let full_id = removed
+                    .as_ref()
+                    .map(|e| e.request_id.as_str())
+                    .unwrap_or(request_id);
                 let payload = serde_json::json!({
                     "type": "elicit_response",
-                    "request_id": request_id,
+                    "request_id": full_id,
                     "value": value,
                 });
-                let topic = format!("astrid.v1.elicit.response.{request_id}");
+                let topic = format!("astrid.v1.elicit.response.{full_id}");
                 if let Err(e) = ipc::publish_json(&topic, &payload) {
                     let _ = log::error(format!(
                         "Failed to publish elicitation response for {request_id}: {e:?}"
@@ -902,11 +910,14 @@ fn handle_elicitation_request(
         .and_then(|t| t.get("Enum"))
         .and_then(|e| e.as_array())
     {
+        // Use a short token for the request_id in callback_data to maximize
+        // space for option values within Telegram's 64-byte limit.
+        let eli_token = callback_token(request_id);
         let buttons: Vec<(String, String)> = options
             .iter()
             .filter_map(|o| o.as_str())
             .filter_map(|o| {
-                let data = format!("eli:{request_id}:{o}");
+                let data = format!("eli:{eli_token}:{o}");
                 // Telegram callback_data max is 64 bytes.
                 if data.len() <= 64 {
                     Some((o.to_string(), data))
