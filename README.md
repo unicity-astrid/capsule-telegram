@@ -91,7 +91,7 @@ All state (sessions, update offset) is persisted in the kernel KV store.
 
 ```bash
 # Build for WASM
-cargo build --target wasm32-wasip2 --release
+cargo build --target wasm32-wasip1 --release
 
 # Run tests (native)
 cargo test
