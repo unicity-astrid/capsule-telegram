@@ -4,11 +4,32 @@
 //! synchronous (WASM single-threaded).
 
 use astrid_sdk::prelude::*;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::types::{InlineKeyboardMarkup, TgMessage, TgResponse, Update};
 
 const BASE_URL: &str = "https://api.telegram.org";
+
+/// Parse a Telegram API response, mapping `ok: false` to an error.
+fn parse_response<T: serde::de::DeserializeOwned>(
+    resp: http::Response,
+    method: &str,
+) -> Result<T, SysError> {
+    let parsed: TgResponse<T> = resp
+        .json()
+        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse response: {e}")))?;
+
+    if !parsed.ok {
+        return Err(SysError::ApiError(format!(
+            "{method}: {}",
+            parsed.description.unwrap_or_else(|| "unknown error".into()),
+        )));
+    }
+
+    parsed
+        .result
+        .ok_or_else(|| SysError::ApiError(format!("{method}: missing result")))
+}
 
 /// Poll for new updates from Telegram.
 ///
@@ -20,21 +41,7 @@ pub fn get_updates(token: &str, offset: i64, timeout: u32) -> Result<Vec<Update>
     );
     let req = http::Request::get(&url);
     let resp = http::send(&req)?;
-
-    if resp.status != 200 {
-        return Err(SysError::ApiError(format!(
-            "Telegram getUpdates failed ({}): {}",
-            resp.status,
-            truncate(&resp.body, 200),
-        )));
-    }
-
-    let parsed: TgResponse<Vec<Update>> = serde_json::from_str(&resp.body)
-        .map_err(|e| SysError::ApiError(format!("Failed to parse getUpdates: {e}")))?;
-
-    parsed
-        .result
-        .ok_or_else(|| SysError::ApiError(parsed.description.unwrap_or_default()))
+    parse_response(resp, "getUpdates")
 }
 
 /// Send a text message to a chat.
@@ -60,21 +67,7 @@ pub fn send_message(
     let url = format!("{BASE_URL}/bot{token}/sendMessage");
     let req = http::Request::post(&url).json(&body)?;
     let resp = http::send(&req)?;
-
-    if resp.status != 200 {
-        return Err(SysError::ApiError(format!(
-            "sendMessage failed ({}): {}",
-            resp.status,
-            truncate(&resp.body, 200),
-        )));
-    }
-
-    let parsed: TgResponse<TgMessage> = serde_json::from_str(&resp.body)
-        .map_err(|e| SysError::ApiError(format!("Failed to parse sendMessage: {e}")))?;
-
-    parsed
-        .result
-        .ok_or_else(|| SysError::ApiError(parsed.description.unwrap_or_default()))
+    parse_response(resp, "sendMessage")
 }
 
 /// Edit the text of an existing message.
@@ -98,13 +91,20 @@ pub fn edit_message_text(
     let req = http::Request::post(&url).json(&body)?;
     let resp = http::send(&req)?;
 
-    // Telegram returns 400 "message is not modified" if text unchanged — not
-    // a real error for our throttled-edit pattern.
-    if resp.status != 200 && !resp.body.contains("message is not modified") {
+    // Telegram returns "message is not modified" when text is unchanged —
+    // not a real error for our throttled-edit pattern.
+    let body_text = resp.text().unwrap_or("");
+    if body_text.contains("message is not modified") {
+        return Ok(());
+    }
+
+    let parsed: TgResponse<serde_json::Value> = serde_json::from_str(body_text)
+        .map_err(|e| SysError::ApiError(format!("editMessageText: parse error: {e}")))?;
+
+    if !parsed.ok {
         return Err(SysError::ApiError(format!(
-            "editMessageText failed ({}): {}",
-            resp.status,
-            truncate(&resp.body, 200),
+            "editMessageText: {}",
+            parsed.description.unwrap_or_default(),
         )));
     }
 
@@ -140,24 +140,17 @@ pub fn send_typing(token: &str, chat_id: i64) -> Result<(), SysError> {
     Ok(())
 }
 
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        let boundary = s.floor_char_boundary(max);
-        &s[..boundary]
-    }
-}
-
 /// Build an inline keyboard with a single row of buttons.
 pub fn inline_keyboard(buttons: Vec<(String, String)>) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
-        inline_keyboard: vec![buttons
-            .into_iter()
-            .map(|(text, data)| crate::types::InlineKeyboardButton {
-                text,
-                callback_data: data,
-            })
-            .collect()],
+        inline_keyboard: vec![
+            buttons
+                .into_iter()
+                .map(|(text, data)| crate::types::InlineKeyboardButton {
+                    text,
+                    callback_data: data,
+                })
+                .collect(),
+        ],
     }
 }

@@ -31,6 +31,7 @@ pub struct TgMessage {
 #[derive(Debug, Deserialize)]
 pub struct TgUser {
     pub id: i64,
+    #[allow(dead_code)]
     pub first_name: String,
 }
 

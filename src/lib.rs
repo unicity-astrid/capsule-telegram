@@ -50,6 +50,7 @@ struct TurnState {
 /// Pending approval waiting for a callback button press.
 struct PendingApproval {
     chat_id: i64,
+    #[allow(dead_code)]
     session_id: String,
 }
 
@@ -62,8 +63,12 @@ impl TelegramBot {
     /// Elicit configuration during capsule installation.
     #[astrid::install]
     fn install(&self) -> Result<(), SysError> {
-        elicit::secret("bot_token")?;
-        elicit::text_with_default("allowed_user_ids", "")?;
+        elicit::secret("bot_token", "Telegram Bot Token (from @BotFather)")?;
+        elicit::text_with_default(
+            "allowed_user_ids",
+            "Comma-separated Telegram user IDs (empty = unrestricted)",
+            "",
+        )?;
         Ok(())
     }
 
@@ -73,9 +78,7 @@ impl TelegramBot {
         // ── Config ──────────────────────────────────────────────────────
         let bot_token = env::var("bot_token")
             .map_err(|_| SysError::ApiError("bot_token not configured".into()))?;
-        let allowed_users = parse_allowed_users(
-            &env::var("allowed_user_ids").unwrap_or_default(),
-        );
+        let allowed_users = parse_allowed_users(&env::var("allowed_user_ids").unwrap_or_default());
 
         if allowed_users.is_empty() {
             let _ = log::warn(
@@ -301,11 +304,9 @@ fn handle_command(
         }
         "/cancel" => {
             if turns.remove(&chat_id).is_some() {
-                let _ =
-                    telegram::send_message(token, chat_id, "Turn cancelled.", None, None);
+                let _ = telegram::send_message(token, chat_id, "Turn cancelled.", None, None);
             } else {
-                let _ =
-                    telegram::send_message(token, chat_id, "No turn in progress.", None, None);
+                let _ = telegram::send_message(token, chat_id, "No turn in progress.", None, None);
             }
         }
         _ => {
@@ -369,11 +370,7 @@ fn handle_callback(
                     );
                 }
             } else {
-                let _ = telegram::answer_callback_query(
-                    token,
-                    &cb.id,
-                    Some("Approval expired"),
-                );
+                let _ = telegram::answer_callback_query(token, &cb.id, Some("Approval expired"));
             }
         }
         "eli" => {
@@ -398,11 +395,7 @@ fn handle_callback(
                     Some(&format!("Selected: {value}")),
                 );
             } else {
-                let _ = telegram::answer_callback_query(
-                    token,
-                    &cb.id,
-                    Some("No active session"),
-                );
+                let _ = telegram::answer_callback_query(token, &cb.id, Some("No active session"));
             }
         }
         _ => {
@@ -495,10 +488,7 @@ fn handle_ipc_event(
                 .get("resource")
                 .and_then(|r| r.as_str())
                 .unwrap_or("");
-            let reason = payload
-                .get("reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
+            let reason = payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
 
             // Find which chat this approval belongs to by checking active turns.
             let chat_id = find_chat_for_event(session_to_chat, sessions, turns);
@@ -547,12 +537,7 @@ fn handle_ipc_event(
     }
 }
 
-fn handle_stream_delta(
-    token: &str,
-    chat_id: i64,
-    text: &str,
-    turns: &mut HashMap<i64, TurnState>,
-) {
+fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMap<i64, TurnState>) {
     if text.is_empty() {
         return;
     }
@@ -574,7 +559,8 @@ fn handle_stream_delta(
                 turn.finalized = false;
             }
         } else {
-            let _ = telegram::edit_message_text(token, chat_id, turn.msg_id, &display, Some("HTML"));
+            let _ =
+                telegram::edit_message_text(token, chat_id, turn.msg_id, &display, Some("HTML"));
         }
         turn.last_edit = Instant::now();
     }
@@ -618,11 +604,14 @@ fn handle_final_response(
                 } else {
                     // Edit the existing message with the final text.
                     let _ = telegram::edit_message_text(
-                        token, chat_id, turn.msg_id, first, Some("HTML"),
+                        token,
+                        chat_id,
+                        turn.msg_id,
+                        first,
+                        Some("HTML"),
                     );
                     for chunk in rest {
-                        let _ =
-                            telegram::send_message(token, chat_id, chunk, Some("HTML"), None);
+                        let _ = telegram::send_message(token, chat_id, chunk, Some("HTML"), None);
                     }
                 }
             }
@@ -671,19 +660,17 @@ fn handle_approval_request(
 
     let keyboard = telegram::inline_keyboard(vec![
         ("Allow Once".into(), format!("apr:{request_id}:allow_once")),
-        ("Allow Session".into(), format!("apr:{request_id}:allow_session")),
+        (
+            "Allow Session".into(),
+            format!("apr:{request_id}:allow_session"),
+        ),
         ("Deny".into(), format!("apr:{request_id}:deny")),
     ]);
 
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
 }
 
-fn handle_elicitation_request(
-    token: &str,
-    chat_id: i64,
-    request_id: &str,
-    field: Option<&Value>,
-) {
+fn handle_elicitation_request(token: &str, chat_id: i64, request_id: &str, field: Option<&Value>) {
     let prompt = field
         .and_then(|f| f.get("prompt"))
         .and_then(|p| p.as_str())
