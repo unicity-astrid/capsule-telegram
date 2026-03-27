@@ -77,7 +77,7 @@ impl TelegramBot {
         }
 
         // ── Register uplink ─────────────────────────────────────────────
-        let _ = uplink::register("telegram", "telegram", "interactive");
+        uplink::register("telegram", "telegram", "interactive")?;
 
         // ── Subscribe to IPC topics ─────────────────────────────────────
         let topics = [
