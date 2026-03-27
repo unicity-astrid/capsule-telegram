@@ -485,7 +485,9 @@ fn handle_callback(
         return;
     };
 
-    // Parse callback data: "apr:{request_id}:{option}" or "eli:{request_id}:{value}"
+    // Parse callback data: "apr:{token}:{decision}" or "eli:{token}:{value}"
+    // where {token} is either the original request_id (if short and colon-free)
+    // or an FNV-1a hash of it (16 hex chars).
     let parts: Vec<&str> = data.splitn(3, ':').collect();
     if parts.len() < 3 {
         let _ = telegram::answer_callback_query(token, &cb.id, Some("Unknown action"));
@@ -1026,7 +1028,9 @@ fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
 /// naive string truncation.
 fn callback_token(request_id: &str) -> String {
     const MAX_TOKEN_LEN: usize = 46;
-    if request_id.len() <= MAX_TOKEN_LEN {
+    // Always hash if the id contains ':' to avoid ambiguous callback_data parsing
+    // (callback format uses ':' as delimiter).
+    if request_id.len() <= MAX_TOKEN_LEN && !request_id.contains(':') {
         request_id.to_string()
     } else {
         // FNV-1a 64-bit hash. Not cryptographically collision-resistant, but
