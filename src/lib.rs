@@ -181,7 +181,6 @@ impl TelegramBot {
             for handle in &sub_handles {
                 match ipc::poll_bytes(handle) {
                     Ok(bytes) if !bytes.is_empty() => {
-                        consecutive_ipc_errors = 0;
                         handle_ipc_poll(
                             &bot_token,
                             &bytes,
@@ -191,6 +190,10 @@ impl TelegramBot {
                             &mut pending_approvals,
                             &mut pending_elicitations,
                         );
+                    }
+                    Ok(_) => {
+                        // Empty poll — reset error counter (subscription is healthy).
+                        consecutive_ipc_errors = 0;
                     }
                     Err(e) => {
                         consecutive_ipc_errors = consecutive_ipc_errors.saturating_add(1);
@@ -204,7 +207,6 @@ impl TelegramBot {
                             ));
                         }
                     }
-                    _ => {}
                 }
             }
 
@@ -700,8 +702,15 @@ fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMa
     };
 
     // Cap buffer to prevent unbounded growth in WASM memory.
-    if turn.text_buffer.len() < MAX_TEXT_BUFFER {
-        turn.text_buffer.push_str(text);
+    let remaining = MAX_TEXT_BUFFER.saturating_sub(turn.text_buffer.len());
+    if remaining > 0 {
+        if text.len() <= remaining {
+            turn.text_buffer.push_str(text);
+        } else {
+            // Append only what fits, truncating at a char boundary.
+            let boundary = text.floor_char_boundary(remaining);
+            turn.text_buffer.push_str(&text[..boundary]);
+        }
     }
     turn.last_activity = Instant::now();
 
@@ -786,14 +795,6 @@ fn handle_approval_request(
         }
     }
 
-    pending_approvals.insert(
-        request_id.to_string(),
-        PendingApproval {
-            chat_id,
-            created_at: Instant::now(),
-        },
-    );
-
     let escaped_action = format::html_escape(action);
     let escaped_resource = format::html_escape(resource);
     let escaped_reason = format::html_escape(reason);
@@ -807,11 +808,24 @@ fn handle_approval_request(
 
     // Truncate request_id if needed to fit within Telegram's 64-byte
     // callback_data limit. "apr:" + ":" + "allow_session" = 18 bytes overhead.
-    let rid = if request_id.len() > 46 {
-        &request_id[..46]
+    // Use the same (possibly truncated) key for both the callback_data and the
+    // pending_approvals map so lookups match on button press.
+    let rid: &str = if request_id.len() > 46 {
+        // Truncate at a char boundary to avoid panic on multi-byte UTF-8.
+        let boundary = request_id.floor_char_boundary(46);
+        &request_id[..boundary]
     } else {
         request_id
     };
+
+    pending_approvals.insert(
+        rid.to_string(),
+        PendingApproval {
+            chat_id,
+            created_at: Instant::now(),
+        },
+    );
+
     let keyboard = telegram::inline_keyboard(vec![
         ("Allow Once".into(), format!("apr:{rid}:allow_once")),
         (
